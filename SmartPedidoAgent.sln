@@ -1,0 +1,27 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AgentService", "src/AgentService/AgentService.csproj", "{2AE347BA-0A7F-4A45-A13C-54BA112A1C4E}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AgentConfigApp", "src/AgentConfigApp/AgentConfigApp.csproj", "{A5627B2A-86FB-4B26-BD8A-96E1D92C676D}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{2AE347BA-0A7F-4A45-A13C-54BA112A1C4E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{2AE347BA-0A7F-4A45-A13C-54BA112A1C4E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{2AE347BA-0A7F-4A45-A13C-54BA112A1C4E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{2AE347BA-0A7F-4A45-A13C-54BA112A1C4E}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A5627B2A-86FB-4B26-BD8A-96E1D92C676D}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A5627B2A-86FB-4B26-BD8A-96E1D92C676D}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A5627B2A-86FB-4B26-BD8A-96E1D92C676D}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A5627B2A-86FB-4B26-BD8A-96E1D92C676D}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal
