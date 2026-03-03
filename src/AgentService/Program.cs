@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Headers;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
@@ -146,31 +147,59 @@ public class AgentWorker : BackgroundService
         }
     }
 
+    private const int MaxAckAttempts = 8;
+
     private async Task ProcessKitchen(AgentConfig cfg, CancellationToken ct)
     {
+        await RetryPendingAcks("order", ct);
         var jobs = await _api.GetKitchenOrders(ct);
         foreach (var job in jobs)
         {
-            if (_state.WasProcessed("order", job.Id)) continue;
-            if (await _printer.Print(job.Id, job.Payload, cfg, ct))
-            {
-                await _api.MarkOrderPrinted(job.Id, ct);
-                _state.MarkProcessed("order", job.Id);
-            }
+            if (!_state.TryClaim("order", job.Id)) continue;
+            if (!await _printer.Print(job.Id, job.Payload, cfg, ct))
+                continue;
+
+            _state.MarkPrintedLocal("order", job.Id);
+            await TryAcknowledgePrinted("order", job.Id, ct);
         }
     }
 
     private async Task ProcessCashier(AgentConfig cfg, CancellationToken ct)
     {
+        await RetryPendingAcks("print-job", ct);
         var jobs = await _api.GetCashierJobs(ct);
         foreach (var job in jobs)
         {
-            if (_state.WasProcessed("print-job", job.Id)) continue;
-            if (await _printer.Print(job.Id, job.Payload, cfg, ct))
-            {
-                await _api.MarkPrintJobPrinted(job.Id, ct);
-                _state.MarkProcessed("print-job", job.Id);
-            }
+            if (!_state.TryClaim("print-job", job.Id)) continue;
+            if (!await _printer.Print(job.Id, job.Payload, cfg, ct))
+                continue;
+
+            _state.MarkPrintedLocal("print-job", job.Id);
+            await TryAcknowledgePrinted("print-job", job.Id, ct);
+        }
+    }
+
+    private async Task RetryPendingAcks(string kind, CancellationToken ct)
+    {
+        foreach (var pending in _state.GetPendingAcks(kind, MaxAckAttempts))
+            await TryAcknowledgePrinted(kind, pending.Id, ct);
+    }
+
+    private async Task TryAcknowledgePrinted(string kind, string id, CancellationToken ct)
+    {
+        try
+        {
+            if (kind == "order")
+                await _api.MarkOrderPrinted(id, ct);
+            else
+                await _api.MarkPrintJobPrinted(id, ct);
+
+            _state.MarkAckedRemote(kind, id);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to ACK printed job {Kind}/{Id}", kind, id);
+            _state.RegisterAckFailure(kind, id, ex.Message);
         }
     }
 }
@@ -209,7 +238,7 @@ public class SmartPedidoApiClient
         var list = new List<AgentJob>();
         foreach (var item in root.EnumerateArray())
         {
-            var id = item.TryGetProperty("id", out var idEl) ? idEl.ToString()! : Guid.NewGuid().ToString("N");
+            var id = ResolveJobId(item);
             list.Add(new AgentJob(id, item.Clone()));
         }
 
@@ -217,18 +246,44 @@ public class SmartPedidoApiClient
     }
 
     public Task MarkOrderPrinted(string id, CancellationToken ct)
-        => PostWithoutBody($"api/agent/orders/{id}/printed", ct);
+        => PostAsync(path: $"api/agent/orders/{id}/printed", ct);
 
     public Task MarkPrintJobPrinted(string id, CancellationToken ct)
-        => PostWithoutBody($"api/agent/print-jobs/{id}/printed", ct);
+        => PostAsync(path: $"api/agent/print-jobs/{id}/printed", ct);
 
-    private async Task PostWithoutBody(string path, CancellationToken ct)
+    private async Task PostAsync(string path, CancellationToken ct)
     {
-        using var response = await _client.PostAsync(path, new StringContent("", Encoding.UTF8, "application/json"), ct);
+        using var response = await _client.PostAsync(path, null, ct);
         if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
             _logger.LogError("Auth failure when posting {Path}", path);
 
         response.EnsureSuccessStatusCode();
+    }
+
+    private static string ResolveJobId(JsonElement item)
+    {
+        if (TryResolveProperty(item, "id", out var id) ||
+            TryResolveProperty(item, "orderId", out id) ||
+            TryResolveProperty(item, "uuid", out id) ||
+            TryResolveProperty(item, "printJobId", out id))
+            return id;
+
+        var raw = item.GetRawText();
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(raw));
+        return Convert.ToHexString(hash).ToLowerInvariant();
+    }
+
+    private static bool TryResolveProperty(JsonElement item, string name, out string value)
+    {
+        if (item.TryGetProperty(name, out var property))
+        {
+            value = property.ToString() ?? string.Empty;
+            if (!string.IsNullOrWhiteSpace(value))
+                return true;
+        }
+
+        value = string.Empty;
+        return false;
     }
 }
 
@@ -243,45 +298,130 @@ public class IdempotencyStore
         _connectionString = $"Data Source={dbPath}";
         using var conn = new SqliteConnection(_connectionString);
         conn.Open();
-        using var cmd = conn.CreateCommand();
-        cmd.CommandText = "CREATE TABLE IF NOT EXISTS processed (kind TEXT NOT NULL, id TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(kind, id));";
-        cmd.ExecuteNonQuery();
-        Cleanup();
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = """
+                CREATE TABLE IF NOT EXISTS jobs (
+                    kind TEXT NOT NULL,
+                    id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    print_attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NULL,
+                    PRIMARY KEY(kind, id)
+                );
+                """;
+            cmd.ExecuteNonQuery();
+        }
+
+        MigrateProcessedTable(conn);
+        Cleanup(conn);
     }
 
-    public bool WasProcessed(string kind, string id)
+    public bool TryClaim(string kind, string id)
     {
         using var conn = new SqliteConnection(_connectionString);
         conn.Open();
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT COUNT(1) FROM processed WHERE kind = $kind AND id = $id";
+        var now = DateTimeOffset.UtcNow.ToString("O");
+        cmd.CommandText = "INSERT OR IGNORE INTO jobs(kind, id, status, created_at, updated_at, print_attempts, last_error) VALUES($kind, $id, 'CLAIMED', $createdAt, $updatedAt, 0, NULL)";
         cmd.Parameters.AddWithValue("$kind", kind);
         cmd.Parameters.AddWithValue("$id", id);
-        return Convert.ToInt32(cmd.ExecuteScalar()) > 0;
+        cmd.Parameters.AddWithValue("$createdAt", now);
+        cmd.Parameters.AddWithValue("$updatedAt", now);
+        return cmd.ExecuteNonQuery() > 0;
     }
 
-    public void MarkProcessed(string kind, string id)
+    public void MarkPrintedLocal(string kind, string id)
+        => UpdateStatus(kind, id, "PRINTED_LOCAL");
+
+    public void MarkAckedRemote(string kind, string id)
+        => UpdateStatus(kind, id, "ACKED_REMOTE");
+
+    public void RegisterAckFailure(string kind, string id, string error)
     {
         using var conn = new SqliteConnection(_connectionString);
         conn.Open();
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "INSERT OR IGNORE INTO processed(kind, id, created_at) VALUES($kind, $id, $createdAt)";
+        cmd.CommandText = "UPDATE jobs SET print_attempts = print_attempts + 1, updated_at = $updatedAt, last_error = $lastError WHERE kind = $kind AND id = $id AND status = 'PRINTED_LOCAL'";
         cmd.Parameters.AddWithValue("$kind", kind);
         cmd.Parameters.AddWithValue("$id", id);
-        cmd.Parameters.AddWithValue("$createdAt", DateTimeOffset.UtcNow.ToString("O"));
+        cmd.Parameters.AddWithValue("$updatedAt", DateTimeOffset.UtcNow.ToString("O"));
+        cmd.Parameters.AddWithValue("$lastError", error);
         cmd.ExecuteNonQuery();
     }
 
-    private void Cleanup()
+    public IReadOnlyCollection<PendingAckJob> GetPendingAcks(string kind, int maxAttempts)
     {
         using var conn = new SqliteConnection(_connectionString);
         conn.Open();
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "DELETE FROM processed WHERE created_at < $limit";
+        cmd.CommandText = "SELECT id, print_attempts, updated_at FROM jobs WHERE kind = $kind AND status = 'PRINTED_LOCAL' AND print_attempts < $maxAttempts";
+        cmd.Parameters.AddWithValue("$kind", kind);
+        cmd.Parameters.AddWithValue("$maxAttempts", maxAttempts);
+
+        var now = DateTimeOffset.UtcNow;
+        var pending = new List<PendingAckJob>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            var id = reader.GetString(0);
+            var attempts = reader.GetInt32(1);
+            var updatedAt = DateTimeOffset.Parse(reader.GetString(2));
+            var backoffSeconds = Math.Min(Math.Pow(2, attempts), 300);
+            if (updatedAt.AddSeconds(backoffSeconds) <= now)
+                pending.Add(new PendingAckJob(id));
+        }
+
+        return pending;
+    }
+
+    private void UpdateStatus(string kind, string id, string status)
+    {
+        using var conn = new SqliteConnection(_connectionString);
+        conn.Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "UPDATE jobs SET status = $status, updated_at = $updatedAt, last_error = $lastError WHERE kind = $kind AND id = $id";
+        cmd.Parameters.AddWithValue("$status", status);
+        cmd.Parameters.AddWithValue("$kind", kind);
+        cmd.Parameters.AddWithValue("$id", id);
+        cmd.Parameters.AddWithValue("$updatedAt", DateTimeOffset.UtcNow.ToString("O"));
+        cmd.Parameters.AddWithValue("$lastError", DBNull.Value);
+        cmd.ExecuteNonQuery();
+    }
+
+    private void MigrateProcessedTable(SqliteConnection conn)
+    {
+        using var existsCmd = conn.CreateCommand();
+        existsCmd.CommandText = "SELECT COUNT(1) FROM sqlite_master WHERE type = 'table' AND name = 'processed'";
+        if (Convert.ToInt32(existsCmd.ExecuteScalar()) == 0) return;
+
+        using (var migrateCmd = conn.CreateCommand())
+        {
+            migrateCmd.CommandText = """
+                INSERT OR IGNORE INTO jobs(kind, id, status, created_at, updated_at, print_attempts, last_error)
+                SELECT kind, id, 'ACKED_REMOTE', created_at, created_at, 0, NULL
+                FROM processed;
+                """;
+            migrateCmd.ExecuteNonQuery();
+        }
+
+        using var dropCmd = conn.CreateCommand();
+        dropCmd.CommandText = "DROP TABLE IF EXISTS processed";
+        dropCmd.ExecuteNonQuery();
+    }
+
+    private void Cleanup(SqliteConnection conn)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM jobs WHERE status = 'ACKED_REMOTE' AND updated_at < $limit";
         cmd.Parameters.AddWithValue("$limit", DateTimeOffset.UtcNow.AddDays(-7).ToString("O"));
         cmd.ExecuteNonQuery();
     }
 }
+
+public record PendingAckJob(string Id);
 
 public class PrintEngine
 {
@@ -340,8 +480,14 @@ public class PrintEngine
             UseShellExecute = false,
             CreateNoWindow = true
         });
-        process?.WaitForExit(30000);
-        return process?.ExitCode == 0;
+        if (process is null) return false;
+        if (!process.WaitForExit(30000))
+        {
+            process.Kill(true);
+            return false;
+        }
+
+        return process.ExitCode == 0;
     }
 
     private bool PrintTcp(string ip, int port, byte[] bytes)
